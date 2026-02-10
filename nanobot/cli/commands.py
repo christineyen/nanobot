@@ -521,6 +521,15 @@ def gateway(
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
     sync_workspace_templates(config.workspace_path)
+
+    # Initialize OpenTelemetry
+    from nanobot.telemetry import init_telemetry
+    init_telemetry(
+        service_name="nanobot",
+        service_version=__version__,
+        environment=os.getenv("ENVIRONMENT", "development"),
+    )
+
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
