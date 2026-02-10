@@ -147,7 +147,10 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         ]
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+        """Build user message content with optional base64-encoded images.
+
+        Uses OpenAI's content block format with data URIs for maximum compatibility.
+        """
         if not media:
             return text
 
