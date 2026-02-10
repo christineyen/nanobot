@@ -1,10 +1,11 @@
 # Nanobot OpenTelemetry Instrumentation
 
-Phase 1: LLM Operation Tracing
+Phase 1 ✅: LLM Operation Tracing
+Phase 2 ✅: Tool Execution Tracing
 
 ## Overview
 
-Nanobot uses OpenTelemetry to instrument LLM operations following the [GenAI Semantic Conventions](https://github.com/open-telemetry/semantic-conventions/tree/main/docs/gen-ai) (experimental).
+Nanobot uses OpenTelemetry to instrument LLM and agent operations following the [GenAI Semantic Conventions](https://github.com/open-telemetry/semantic-conventions/tree/main/docs/gen-ai) (experimental).
 
 ## What's Instrumented
 
@@ -13,6 +14,12 @@ Nanobot uses OpenTelemetry to instrument LLM operations following the [GenAI Sem
 - **Attributes**: Request model, provider, max tokens, temperature, usage, finish reasons
 - **Metrics**: Operation duration and token usage (input/output separately)
 - **Content Capture**: Inputs, outputs, and tool definitions are captured by default
+
+### Tool Execution
+- **Spans**: Every tool call creates a span named `execute_tool {tool_name}`
+- **Attributes**: Tool name, call ID, type (function), arguments, results
+- **Nesting**: Tool spans are nested under the LLM span that requested them
+- **Error Tracking**: Captures tool execution failures with exception details
 
 ### Auto-Instrumentation
 - **HTTPX**: All HTTP requests (including LLM API calls) are automatically traced
@@ -58,6 +65,8 @@ export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"
 
 ### Traces
 
+#### LLM Operations
+
 Every LLM operation creates a trace with:
 
 **Span Name:** `chat anthropic/claude-3-5-sonnet-20241022`
@@ -76,11 +85,39 @@ Every LLM operation creates a trace with:
 - `gen_ai.output.messages` = (full response)
 - `gen_ai.tool.definitions` = (if tools provided)
 
+#### Tool Executions
+
+Nested under LLM spans:
+
+**Span Name:** `execute_tool read_file`
+
+**Attributes:**
+- `gen_ai.operation.name` = "execute_tool"
+- `gen_ai.tool.name` = "read_file"
+- `gen_ai.tool.type` = "function"
+- `gen_ai.tool.call.id` = "call_abc123"
+- `gen_ai.tool.call.arguments` = `{"path": "/path/to/file"}`
+- `gen_ai.tool.call.result` = (tool output, truncated to 1000 chars)
+- `error.type` = (if tool failed)
+
+#### Nested Trace Example
+
+```
+chat claude-3-5-sonnet (2.5s)
+  ├─ execute_tool read_file (0.05s)
+  │   └─ httpx GET /api (0.02s)  [auto-instrumented]
+  ├─ execute_tool web_search (0.8s)
+  │   └─ httpx POST https://api.search.brave.com (0.75s)
+  └─ chat continues... (1.65s)
+```
+
 **Metrics:**
 - `gen_ai.client.operation.duration` - Histogram of operation latencies
 - `gen_ai.client.token.usage` - Histogram of token counts (separate for input/output)
 
 ### Example Honeycomb Queries
+
+#### LLM Queries
 
 ```
 # Average latency by model
@@ -93,10 +130,39 @@ VISUALIZE SUM(gen_ai.client.token.usage)
 WHERE gen_ai.token.type = "output"
 GROUP BY gen_ai.provider.name
 
-# Error rates
+# LLM error rates
 VISUALIZE COUNT
-WHERE error.type EXISTS
+WHERE gen_ai.operation.name = "chat" AND error.type EXISTS
 GROUP BY gen_ai.provider.name, error.type
+```
+
+#### Tool Execution Queries
+
+```
+# Most frequently used tools
+VISUALIZE COUNT
+WHERE gen_ai.operation.name = "execute_tool"
+GROUP BY gen_ai.tool.name
+
+# Tool execution latency
+VISUALIZE P50(duration_ms), P95(duration_ms), P99(duration_ms)
+WHERE gen_ai.operation.name = "execute_tool"
+GROUP BY gen_ai.tool.name
+
+# Tool failure rates
+VISUALIZE COUNT
+WHERE gen_ai.operation.name = "execute_tool" AND error.type EXISTS
+GROUP BY gen_ai.tool.name, error.type
+
+# Tools per LLM request
+VISUALIZE COUNT(gen_ai.tool.name)
+GROUP BY trace.trace_id
+
+# Slowest tool calls
+VISUALIZE duration_ms, gen_ai.tool.name, gen_ai.tool.call.arguments
+WHERE gen_ai.operation.name = "execute_tool"
+ORDER BY duration_ms DESC
+LIMIT 20
 ```
 
 ## Privacy & Content Capture
@@ -188,11 +254,6 @@ If telemetry causes high memory:
 3. Temporarily disable telemetry by unsetting `OTEL_EXPORTER_OTLP_ENDPOINT`
 
 ## What's Next
-
-### Phase 2: Tool Execution Tracing
-- Instrument tool calls with `execute_tool {tool_name}` spans
-- Track tool execution duration and success/failure
-- Capture tool arguments and results (opt-in)
 
 ### Phase 3: Privacy Controls
 - Configuration to disable input/output capture

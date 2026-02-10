@@ -29,6 +29,7 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
+from nanobot.telemetry import tool_execution_span
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
