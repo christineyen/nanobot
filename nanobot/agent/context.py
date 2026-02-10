@@ -159,22 +159,61 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         return messages
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+        """Build user message content with optional base64-encoded images.
+
+        Uses OpenAI's content block format with data URIs for maximum compatibility.
+        """
         if not media:
             return text
-        
-        images = []
+
+        content_blocks = []
+
+        # Add images first (OpenAI format with proper data URI)
         for path in media:
             p = Path(path)
-            mime, _ = mimetypes.guess_type(path)
-            if not p.is_file() or not mime or not mime.startswith("image/"):
+
+            # Check if file exists and get size
+            if not p.is_file():
+                from loguru import logger
+                logger.warning(f"Image file not found: {path}")
                 continue
-            b64 = base64.b64encode(p.read_bytes()).decode()
-            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-        
-        if not images:
+
+            file_size = p.stat().st_size
+            from loguru import logger
+            logger.info(f"Processing image: {path} (size: {file_size} bytes)")
+
+            # Guess MIME type from file extension
+            mime, _ = mimetypes.guess_type(path)
+            if not mime or not mime.startswith("image/"):
+                logger.warning(f"Invalid MIME type for {path}: {mime}")
+                continue
+
+            # Check size limit (5MB for Anthropic, but let's be safer)
+            if file_size > 5 * 1024 * 1024:
+                logger.warning(f"Image too large: {file_size} bytes (max 5MB)")
+                continue
+
+            # Read and base64 encode the image
+            b64_data = base64.b64encode(p.read_bytes()).decode()
+            logger.info(f"Image encoded: mime={mime}, base64_length={len(b64_data)}")
+
+            # Use OpenAI format with data URI
+            content_blocks.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{b64_data}"
+                }
+            })
+
+        # Add text content
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+
+        # If no images were successfully loaded, just return text
+        if len(content_blocks) == 1 and content_blocks[0]["type"] == "text":
             return text
-        return images + [{"type": "text", "text": text}]
+
+        return content_blocks if content_blocks else text
     
     def add_tool_result(
         self,

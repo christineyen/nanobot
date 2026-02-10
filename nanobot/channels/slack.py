@@ -320,38 +320,76 @@ class SlackChannel(BaseChannel):
                 continue
 
             try:
-                # Download file with proper auth handling for redirects
-                # Use httpx but disable automatic redirect following and handle manually
-                async with httpx.AsyncClient(follow_redirects=False) as client:
-                    # First request with auth header
+                # Use Slack SDK to download file with proper authentication
+                # The SDK handles auth and redirects correctly
+                file_id = file_obj.get("id")
+                if not file_id:
+                    logger.warning("No file ID in Slack file object")
+                    continue
+
+                # Download file using Slack API
+                file_info = await self._web_client.files_info(file=file_id)
+                if not file_info.get("ok"):
+                    logger.error(f"Failed to get file info: {file_info.get('error')}")
+                    continue
+
+                # Get the URL to download
+                file_data = file_info.get("file", {})
+                download_url = file_data.get("url_private_download") or file_data.get("url_private")
+
+                if not download_url:
+                    logger.warning("No download URL in file info")
+                    continue
+
+                # Download using the web client's session which handles auth
+                async with httpx.AsyncClient() as client:
                     response = await client.get(
-                        url_private,
+                        download_url,
                         headers={"Authorization": f"Bearer {self.config.bot_token}"},
+                        follow_redirects=True,
                         timeout=30.0
                     )
-
-                    # If we get a redirect, follow it (the redirect URL is pre-signed, no auth needed)
-                    if response.status_code in (301, 302, 303, 307, 308):
-                        redirect_url = response.headers.get("Location")
-                        if redirect_url:
-                            logger.debug(f"Following redirect to {redirect_url[:50]}...")
-                            response = await client.get(redirect_url, timeout=30.0)
-
                     response.raise_for_status()
+
+                    # Check file size (Anthropic has 5MB limit)
+                    content = response.content
+                    file_size = len(content)
+                    if file_size > 5 * 1024 * 1024:
+                        logger.warning(f"Slack image too large: {file_size} bytes (max 5MB), skipping")
+                        continue
+
+                    # Log first few bytes to verify it's a valid image
+                    header = content[:20].hex() if len(content) >= 20 else content.hex()
+                    logger.debug(f"Image header bytes: {header}")
+
+                    # If it looks like HTML, log the error
+                    if content.startswith(b"<!DOCTYPE") or content.startswith(b"<html"):
+                        error_text = content[:500].decode("utf-8", errors="ignore")
+                        logger.error(f"Received HTML instead of image: {error_text}")
+                        continue
 
                     # Save to temp file with proper extension
                     filetype = file_obj.get("filetype", "png")
                     suffix = f".{filetype}"
+
+                    logger.info(f"Downloading Slack image: mimetype={mimetype}, filetype={filetype}, size={file_size}")
 
                     with tempfile.NamedTemporaryFile(
                         mode="wb",
                         suffix=suffix,
                         delete=False
                     ) as tmp:
-                        tmp.write(response.content)
+                        bytes_written = tmp.write(content)
+                        tmp.flush()  # Explicitly flush to disk
                         local_path = tmp.name
-                        local_paths.append(local_path)
-                        logger.info(f"Downloaded Slack file to {local_path}")
+                        logger.info(f"Saved Slack image to {local_path} ({bytes_written} bytes written)")
+
+                    # Verify the file was written correctly
+                    if Path(local_path).stat().st_size != file_size:
+                        logger.error(f"File size mismatch: expected {file_size}, got {Path(local_path).stat().st_size}")
+                        continue
+
+                    local_paths.append(local_path)
 
             except Exception as e:
                 logger.error(f"Failed to download Slack file: {e}")
