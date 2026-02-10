@@ -16,6 +16,66 @@ from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import SlackConfig
 
 
+def markdown_to_slack(text: str) -> str:
+    """Convert standard markdown to Slack mrkdwn format.
+
+    Conversions:
+    - **bold** → *bold*
+    - *italic* or _italic_ → _italic_
+    - [link](url) → <url|link>
+    - # Headers → *Header* (bold text)
+    - - bullets → * bullets
+    - ~~strikethrough~~ → ~strikethrough~
+    """
+    if not text:
+        return text
+
+    # Convert headers (# Header) to bold (*Header*)
+    # Match 1-6 # symbols at start of line followed by space and text
+    text = re.sub(r'^#{1,6}\s+(.+)$', r'*\1*', text, flags=re.MULTILINE)
+
+    # Convert links: [text](url) → <url|text>
+    # Note: This handles simple links. Complex nested cases might need more work.
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<\2|\1>', text)
+
+    # Convert strikethrough: ~~text~~ → ~text~
+    text = re.sub(r'~~([^~]+)~~', r'~\1~', text)
+
+    # Convert bold: **text** or __text__ → *text*
+    # We need to be careful not to confuse with italic markers
+    # Process bold before italic to handle ** before *
+    text = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', text)
+    text = re.sub(r'__([^_]+)__', r'*\1*', text)
+
+    # Convert italic: *text* or _text_ (single) → _text_
+    # But we need to skip already-converted bold (which now uses single *)
+    # This is tricky - we'll convert remaining single * and _ to _
+    # We need to avoid re-converting our bold markers
+
+    # For italic, we need to be more careful. Let's use a different approach:
+    # First, protect already-converted bold markers by temporarily replacing them
+    bold_pattern = re.compile(r'\*([^*\n]+)\*')
+    bold_matches = []
+
+    def save_bold(match):
+        bold_matches.append(match.group(0))
+        return f"__BOLD_{len(bold_matches)-1}__"
+
+    text = bold_pattern.sub(save_bold, text)
+
+    # Now convert remaining single * to _ for italic
+    text = re.sub(r'(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)', r'_\1_', text)
+
+    # Restore bold markers
+    for i, bold_text in enumerate(bold_matches):
+        text = text.replace(f"__BOLD_{i}__", bold_text)
+
+    # Convert bullet points: - at start of line or after whitespace → *
+    text = re.sub(r'^(\s*)- ', r'\1* ', text, flags=re.MULTILINE)
+
+    return text
+
+
 class SlackChannel(BaseChannel):
     """Slack channel using Socket Mode."""
 
@@ -82,9 +142,26 @@ class SlackChannel(BaseChannel):
             channel_type = slack_meta.get("channel_type")
             # Only reply in thread for channel/group messages; DMs don't use threads
             use_thread = thread_ts and channel_type != "im"
+
+            content = msg.content or ""
+            # Convert standard markdown to Slack mrkdwn format
+            slack_content = markdown_to_slack(content)
+
+            # Use Block Kit for proper markdown formatting
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": slack_content
+                    }
+                }
+            ]
+
             await self._web_client.chat_postMessage(
                 channel=msg.chat_id,
-                text=msg.content or "",
+                text=slack_content,  # Fallback text for notifications
+                blocks=blocks,
                 thread_ts=thread_ts if use_thread else None,
             )
         except Exception as e:
