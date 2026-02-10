@@ -20,6 +20,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
+from nanobot.telemetry import tool_execution_span
 
 
 class AgentLoop:
@@ -221,7 +222,18 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
+                    # Create telemetry span for tool execution
+                    with tool_execution_span(
+                        tool_name=tool_call.name,
+                        tool_call_id=tool_call.id,
+                        arguments=tool_call.arguments,
+                    ) as span:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
+                        # Capture the result in telemetry (truncated to 1000 chars)
+                        span.set_result(result, truncate_at=1000)
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -326,7 +338,16 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
+                    # Create telemetry span for tool execution
+                    with tool_execution_span(
+                        tool_name=tool_call.name,
+                        tool_call_id=tool_call.id,
+                        arguments=tool_call.arguments,
+                    ) as span:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                        span.set_result(result, truncate_at=1000)
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
