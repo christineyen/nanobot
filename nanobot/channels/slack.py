@@ -150,16 +150,99 @@ class SlackChannel(BaseChannel):
             # Convert standard markdown to Slack mrkdwn format
             slack_content = markdown_to_slack(content)
 
-            # Use Block Kit for proper markdown formatting
-            blocks = [
-                {
+            # Slack has a 3000 character limit per text block
+            # Split long messages into multiple blocks
+            MAX_BLOCK_LENGTH = 3000
+            blocks = []
+
+            if len(slack_content) <= MAX_BLOCK_LENGTH:
+                # Short message - single block
+                blocks.append({
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
                         "text": slack_content
                     }
-                }
-            ]
+                })
+            else:
+                # Long message - split into chunks
+                # Try to split at paragraph breaks for better readability
+                chunks = []
+                current_chunk = []
+                current_length = 0
+
+                # Split by paragraphs (double newline)
+                paragraphs = slack_content.split('\n\n')
+
+                for para in paragraphs:
+                    para_length = len(para) + 2  # +2 for the \n\n we'll add back
+
+                    # If single paragraph is too long, split it further
+                    if para_length > MAX_BLOCK_LENGTH:
+                        # Save current chunk if any
+                        if current_chunk:
+                            chunks.append('\n\n'.join(current_chunk))
+                            current_chunk = []
+                            current_length = 0
+
+                        # Split long paragraph by sentences or lines
+                        lines = para.split('\n')
+                        line_chunk = []
+                        line_length = 0
+
+                        for line in lines:
+                            if line_length + len(line) + 1 > MAX_BLOCK_LENGTH:
+                                if line_chunk:
+                                    chunks.append('\n'.join(line_chunk))
+                                    line_chunk = []
+                                    line_length = 0
+
+                                # If single line is still too long, hard truncate
+                                if len(line) > MAX_BLOCK_LENGTH:
+                                    chunks.append(line[:MAX_BLOCK_LENGTH - 3] + "...")
+                                else:
+                                    line_chunk.append(line)
+                                    line_length = len(line)
+                            else:
+                                line_chunk.append(line)
+                                line_length += len(line) + 1
+
+                        if line_chunk:
+                            chunks.append('\n'.join(line_chunk))
+                    else:
+                        # Paragraph fits, check if it fits in current chunk
+                        if current_length + para_length > MAX_BLOCK_LENGTH:
+                            # Save current chunk and start new one
+                            chunks.append('\n\n'.join(current_chunk))
+                            current_chunk = [para]
+                            current_length = para_length
+                        else:
+                            current_chunk.append(para)
+                            current_length += para_length
+
+                # Add remaining chunk
+                if current_chunk:
+                    chunks.append('\n\n'.join(current_chunk))
+
+                # Convert chunks to blocks (max 50 blocks per message)
+                for i, chunk in enumerate(chunks[:50]):  # Slack limit: 50 blocks
+                    blocks.append({
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": chunk
+                        }
+                    })
+
+                # If we had to truncate (more than 50 chunks), add a note
+                if len(chunks) > 50:
+                    blocks.append({
+                        "type": "context",
+                        "elements": [{
+                            "type": "mrkdwn",
+                            "text": f"_Message truncated ({len(chunks) - 50} blocks omitted)_"
+                        }]
+                    })
 
             await self._web_client.chat_postMessage(
                 channel=msg.chat_id,
