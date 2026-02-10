@@ -2,8 +2,11 @@
 
 import asyncio
 import re
+import tempfile
+from pathlib import Path
 from typing import Any
 
+import httpx
 from loguru import logger
 from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
@@ -228,6 +231,11 @@ class SlackChannel(BaseChannel):
         text = self._strip_bot_mention(text)
 
         thread_ts = event.get("thread_ts") or event.get("ts")
+
+        # Download any attached files (images)
+        files = event.get("files", [])
+        media_paths = await self._download_slack_files(files) if files else []
+
         # Add :eyes: reaction to the triggering message (best-effort)
         try:
             if self._web_client and event.get("ts"):
@@ -243,6 +251,7 @@ class SlackChannel(BaseChannel):
             sender_id=sender_id,
             chat_id=chat_id,
             content=text,
+            media=media_paths,
             metadata={
                 "slack": {
                     "event": event,
@@ -280,3 +289,72 @@ class SlackChannel(BaseChannel):
         if not text or not self._bot_user_id:
             return text
         return re.sub(rf"<@{re.escape(self._bot_user_id)}>\s*", "", text).strip()
+
+    async def _download_slack_files(self, files: list[dict[str, Any]]) -> list[str]:
+        """
+        Download Slack files to temporary locations and return local paths.
+
+        Only downloads image files for vision model support.
+
+        Args:
+            files: List of file objects from Slack event.
+
+        Returns:
+            List of local file paths.
+        """
+        if not files or not self._web_client:
+            return []
+
+        local_paths = []
+
+        for file_obj in files:
+            # Only handle images for now
+            mimetype = file_obj.get("mimetype", "")
+            if not mimetype.startswith("image/"):
+                logger.debug(f"Skipping non-image file: {mimetype}")
+                continue
+
+            url_private = file_obj.get("url_private_download") or file_obj.get("url_private")
+            if not url_private:
+                logger.warning("No download URL for Slack file")
+                continue
+
+            try:
+                # Download file with proper auth handling for redirects
+                # Use httpx but disable automatic redirect following and handle manually
+                async with httpx.AsyncClient(follow_redirects=False) as client:
+                    # First request with auth header
+                    response = await client.get(
+                        url_private,
+                        headers={"Authorization": f"Bearer {self.config.bot_token}"},
+                        timeout=30.0
+                    )
+
+                    # If we get a redirect, follow it (the redirect URL is pre-signed, no auth needed)
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        redirect_url = response.headers.get("Location")
+                        if redirect_url:
+                            logger.debug(f"Following redirect to {redirect_url[:50]}...")
+                            response = await client.get(redirect_url, timeout=30.0)
+
+                    response.raise_for_status()
+
+                    # Save to temp file with proper extension
+                    filetype = file_obj.get("filetype", "png")
+                    suffix = f".{filetype}"
+
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        suffix=suffix,
+                        delete=False
+                    ) as tmp:
+                        tmp.write(response.content)
+                        local_path = tmp.name
+                        local_paths.append(local_path)
+                        logger.info(f"Downloaded Slack file to {local_path}")
+
+            except Exception as e:
+                logger.error(f"Failed to download Slack file: {e}")
+                continue
+
+        return local_paths
