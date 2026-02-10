@@ -125,11 +125,26 @@ class SlackChannel(BaseChannel):
             # Slack rejects empty text payloads. Keep media-only messages media-only,
             # but send a single blank message when the bot has no text or files to send.
             if msg.content or not (msg.media or []):
-                await self._web_client.chat_postMessage(
-                    channel=msg.chat_id,
-                    text=self._to_mrkdwn(msg.content) if msg.content else " ",
-                    thread_ts=thread_ts_param,
-                )
+                slack_content = self._to_mrkdwn(msg.content) if msg.content else " "
+
+                # Slack has a 3000 character limit per text block.
+                # Split long messages into multiple blocks for readability.
+                MAX_BLOCK_LENGTH = 3000
+
+                if len(slack_content) <= MAX_BLOCK_LENGTH:
+                    await self._web_client.chat_postMessage(
+                        channel=msg.chat_id,
+                        text=slack_content,
+                        thread_ts=thread_ts_param,
+                    )
+                else:
+                    blocks = self._split_to_blocks(slack_content, MAX_BLOCK_LENGTH)
+                    await self._web_client.chat_postMessage(
+                        channel=msg.chat_id,
+                        text=slack_content[:MAX_BLOCK_LENGTH],  # fallback text
+                        blocks=blocks,
+                        thread_ts=thread_ts_param,
+                    )
 
             for media_path in msg.media or []:
                 try:
@@ -351,6 +366,60 @@ class SlackChannel(BaseChannel):
             if parts:
                 rows.append(" · ".join(parts))
         return "\n".join(rows)
+
+    @staticmethod
+    def _split_to_blocks(text: str, max_length: int = 3000) -> list[dict]:
+        """Split long text into Slack section blocks respecting the character limit."""
+        chunks: list[str] = []
+        current_chunk: list[str] = []
+        current_length = 0
+
+        for para in text.split("\n\n"):
+            para_len = len(para) + 2  # account for \n\n separator
+
+            if para_len > max_length:
+                if current_chunk:
+                    chunks.append("\n\n".join(current_chunk))
+                    current_chunk, current_length = [], 0
+
+                # Split oversized paragraph by lines
+                line_chunk: list[str] = []
+                line_length = 0
+                for line in para.split("\n"):
+                    if line_length + len(line) + 1 > max_length:
+                        if line_chunk:
+                            chunks.append("\n".join(line_chunk))
+                            line_chunk, line_length = [], 0
+                        if len(line) > max_length:
+                            chunks.append(line[: max_length - 3] + "...")
+                        else:
+                            line_chunk.append(line)
+                            line_length = len(line)
+                    else:
+                        line_chunk.append(line)
+                        line_length += len(line) + 1
+                if line_chunk:
+                    chunks.append("\n".join(line_chunk))
+            elif current_length + para_len > max_length:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk, current_length = [para], para_len
+            else:
+                current_chunk.append(para)
+                current_length += para_len
+
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
+            for chunk in chunks[:50]
+        ]
+        if len(chunks) > 50:
+            blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"_Message truncated ({len(chunks) - 50} blocks omitted)_"}],
+            })
+        return blocks
 
     async def _download_slack_files(self, files: list[dict[str, Any]]) -> list[str]:
         """
