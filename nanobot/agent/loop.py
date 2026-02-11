@@ -177,8 +177,11 @@ class AgentLoop:
             cron_tool.set_context(msg.channel, msg.chat_id)
         
         # Build initial messages (use get_history for LLM-formatted messages)
+        # When media (images) are attached, limit history to keep the request
+        # size reasonable — large context can cause the model to ignore images.
+        max_history = 10 if msg.media else 50
         messages = self.context.build_messages(
-            history=session.get_history(),
+            history=session.get_history(max_messages=max_history),
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,

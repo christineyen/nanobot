@@ -279,15 +279,17 @@ class SlackChannel(BaseChannel):
         chat_id = event.get("channel")
 
         # Ignore bot/system messages (any subtype = not a normal user message)
-        if event.get("subtype"):
+        if event.get("subtype") and event.get("subtype") != "file_share":
             return
         if self._bot_user_id and sender_id == self._bot_user_id:
             return
 
         # Avoid double-processing: Slack sends both `message` and `app_mention`
-        # for mentions in channels. Prefer `app_mention`.
+        # for mentions in channels. Prefer `app_mention` UNLESS there are files
+        # attached, since only the message event carries file attachments.
         text = event.get("text") or ""
-        if event_type == "message" and self._bot_user_id and f"<@{self._bot_user_id}>" in text:
+        files = event.get("files", [])
+        if event_type == "message" and self._bot_user_id and f"<@{self._bot_user_id}>" in text and not files:
             return
 
         # Debug: log basic event shape
@@ -316,7 +318,6 @@ class SlackChannel(BaseChannel):
         thread_ts = event.get("thread_ts") or event.get("ts")
 
         # Download any attached files (images)
-        files = event.get("files", [])
         media_paths = await self._download_slack_files(files) if files else []
 
         # Add :eyes: reaction to the triggering message (best-effort)
