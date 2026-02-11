@@ -480,7 +480,10 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = session.get_history(max_messages=0)
+        # When media (images) are attached, limit history to keep the request
+        # size reasonable - large context can cause the model to ignore images.
+        max_history = 0 if not msg.media else 10
+        history = session.get_history(max_messages=max_history)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
