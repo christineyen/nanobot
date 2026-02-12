@@ -177,6 +177,7 @@ class LiteLLMProvider(LLMProvider):
             # Capture input messages (full content capture enabled by default)
             try:
                 span.set_attribute(GenAIAttributes.INPUT_MESSAGES, json.dumps(messages))
+                span.set_attribute(GenAIAttributes.INPUT_MESSAGES_LENGTH, len(messages))
             except Exception as e:
                 logger.debug(f"Failed to capture input messages: {e}")
 
