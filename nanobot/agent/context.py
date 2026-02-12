@@ -146,15 +146,29 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             {"role": current_role, "content": merged},
         ]
 
+    # MIME types that can be sent as image_url content blocks
+    _IMAGE_MIMES = frozenset({
+        "image/jpeg", "image/png", "image/gif", "image/webp",
+    })
+
+    # MIME types that can be sent as file content blocks (documents)
+    _DOCUMENT_MIMES = frozenset({
+        "application/pdf",
+    })
+
+    _SUPPORTED_MIMES = _IMAGE_MIMES | _DOCUMENT_MIMES
+
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images.
+        """Build user message content with optional media (images and documents).
 
         Uses OpenAI's content block format with data URIs for maximum compatibility.
+        Images use ``image_url`` blocks; documents (e.g. PDFs) use ``file`` blocks
+        following the LiteLLM convention.
         """
         if not media:
             return text
 
-        images = []
+content_blocks = []
         for path in media:
             p = Path(path)
             if not p.is_file():
@@ -162,20 +176,31 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             raw = p.read_bytes()
             # Detect real MIME type from magic bytes; fallback to filename guess
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
-            if not mime or not mime.startswith("image/"):
+            if not mime or mime not in self._SUPPORTED_MIMES:
                 continue
             b64 = base64.b64encode(raw).decode()
-            images.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-                "_meta": {"path": str(p)},
-            })
 
-        if not images:
+            if mime in self._IMAGE_MIMES:
+                content_blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    "_meta": {"path": str(p)},
+                })
+            else:
+                # Document content block (PDFs, etc.)
+                content_blocks.append({
+                    "type": "file",
+                    "file": {
+                        "file_data": f"data:{mime};base64,{b64}",
+                    },
+                    "_meta": {"path": str(p)},
+                })
+
+        if not content_blocks:
             return text
-        return images + [{"type": "text", "text": text}]
+        return content_blocks + [{"type": "text", "text": text}]
 
-    def add_tool_result(
+        def add_tool_result(
         self, messages: list[dict[str, Any]],
         tool_call_id: str, tool_name: str, result: Any,
     ) -> list[dict[str, Any]]:
