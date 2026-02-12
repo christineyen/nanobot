@@ -158,58 +158,80 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
 
         return messages
 
+    # MIME types that can be sent as image_url content blocks
+    _IMAGE_MIMES = frozenset({
+        "image/jpeg", "image/png", "image/gif", "image/webp",
+    })
+
+    # MIME types that can be sent as file content blocks (documents)
+    _DOCUMENT_MIMES = frozenset({
+        "application/pdf",
+    })
+
+    _SUPPORTED_MIMES = _IMAGE_MIMES | _DOCUMENT_MIMES
+
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images.
+        """Build user message content with optional media (images and documents).
 
         Uses OpenAI's content block format with data URIs for maximum compatibility.
+        Images use ``image_url`` blocks; documents (e.g. PDFs) use ``file`` blocks
+        following the LiteLLM convention.
         """
         if not media:
             return text
 
         content_blocks = []
 
-        # Add images first (OpenAI format with proper data URI)
         for path in media:
             p = Path(path)
 
             # Check if file exists and get size
             if not p.is_file():
                 from loguru import logger
-                logger.warning(f"Image file not found: {path}")
+                logger.warning(f"Media file not found: {path}")
                 continue
 
             file_size = p.stat().st_size
             from loguru import logger
-            logger.info(f"Processing image: {path} (size: {file_size} bytes)")
+            logger.info(f"Processing media: {path} (size: {file_size} bytes)")
 
             # Guess MIME type from file extension
             mime, _ = mimetypes.guess_type(path)
-            if not mime or not mime.startswith("image/"):
-                logger.warning(f"Invalid MIME type for {path}: {mime}")
+            if not mime or mime not in self._SUPPORTED_MIMES:
+                logger.warning(f"Unsupported MIME type for {path}: {mime}")
                 continue
 
             # Check size limit (5MB for Anthropic, but let's be safer)
             if file_size > 5 * 1024 * 1024:
-                logger.warning(f"Image too large: {file_size} bytes (max 5MB)")
+                logger.warning(f"File too large: {file_size} bytes (max 5MB)")
                 continue
 
-            # Read and base64 encode the image
+            # Read and base64 encode the file
             b64_data = base64.b64encode(p.read_bytes()).decode()
-            logger.info(f"Image encoded: mime={mime}, base64_length={len(b64_data)}")
+            logger.info(f"Media encoded: mime={mime}, base64_length={len(b64_data)}")
 
-            # Use OpenAI format with data URI
-            content_blocks.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime};base64,{b64_data}"
-                }
-            })
+            if mime in self._IMAGE_MIMES:
+                # Use OpenAI image_url format with data URI
+                content_blocks.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{b64_data}"
+                    }
+                })
+            else:
+                # Use LiteLLM file format for documents (PDFs, etc.)
+                content_blocks.append({
+                    "type": "file",
+                    "file": {
+                        "file_data": f"data:{mime};base64,{b64_data}",
+                    }
+                })
 
         # Add text content
         if text:
             content_blocks.append({"type": "text", "text": text})
 
-        # If no images were successfully loaded, just return text
+        # If no media were successfully loaded, just return text
         if len(content_blocks) == 1 and content_blocks[0]["type"] == "text":
             return text
 

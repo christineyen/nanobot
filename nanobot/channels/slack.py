@@ -391,11 +391,12 @@ class SlackChannel(BaseChannel):
 
         local_paths = []
 
+        _supported = {"image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"}
+
         for file_obj in files:
-            # Only handle images for now
             mimetype = file_obj.get("mimetype", "")
-            if not mimetype.startswith("image/"):
-                logger.debug(f"Skipping non-image file: {mimetype}")
+            if mimetype not in _supported:
+                logger.debug(f"Skipping unsupported file type: {mimetype}")
                 continue
 
             url_private = file_obj.get("url_private_download") or file_obj.get("url_private")
