@@ -37,6 +37,7 @@ class GenAIAttributes:
     # Content attributes (opt-in, sensitive)
     SYSTEM_INSTRUCTIONS = "gen_ai.system_instructions"
     INPUT_MESSAGES = "gen_ai.input.messages"
+    INPUT_MESSAGES_LENGTH = "gen_ai.input.messages.length"
     OUTPUT_MESSAGES = "gen_ai.output.messages"
 
     # Tool attributes
