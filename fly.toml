@@ -8,16 +8,16 @@ primary_region = 'sjc'
 
 [build]
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+# No [http_service] — nanobot gateway doesn't serve HTTP.
+# It connects outbound to channels (Slack socket mode, Telegram, etc.)
+# The Dockerfile ENTRYPOINT + CMD handles startup: entrypoint.sh writes
+# config from NANOBOT_CONFIG_JSON secret, then runs `nanobot gateway`.
 
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 256
+
+[mounts]
+  source = "workspace"
+  destination = "/data"
