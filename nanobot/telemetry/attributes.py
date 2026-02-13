@@ -79,3 +79,24 @@ class ToolType:
     FUNCTION = "function"
     EXTENSION = "extension"
     DATASTORE = "datastore"
+
+
+class NanobotAttributes:
+    """Nanobot-specific span attributes (not part of OTel GenAI conventions)."""
+
+    CHANNEL = "nanobot.channel"
+    SENDER_ID = "nanobot.sender_id"
+    SESSION_KEY = "nanobot.session.key"
+    MESSAGE_LENGTH = "nanobot.message.length"
+    MESSAGE_HAS_MEDIA = "nanobot.message.has_media"
+    ITERATIONS = "nanobot.iterations"
+    RESPONSE_LENGTH = "nanobot.response.length"
+    FILES_COUNT = "nanobot.files.count"
+
+
+class MessagingAttributes:
+    """OTel messaging semantic convention attributes."""
+
+    SYSTEM = "messaging.system"
+    OPERATION = "messaging.operation"
+    DESTINATION_NAME = "messaging.destination.name"

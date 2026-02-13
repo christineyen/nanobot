@@ -20,7 +20,10 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from nanobot.telemetry import tool_execution_span
+from nanobot.telemetry.attributes import NanobotAttributes
 
 
 class AgentLoop:
@@ -156,113 +159,128 @@ class AgentLoop:
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
             return await self._process_system_message(msg)
-        
+
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
-        
-        # Get or create session
-        session = self.sessions.get_or_create(msg.session_key)
-        
-        # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(msg.channel, msg.chat_id)
-        
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(msg.channel, msg.chat_id)
-        
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(msg.channel, msg.chat_id)
-        
-        # Build initial messages (use get_history for LLM-formatted messages)
-        # When media (images) are attached, limit history to keep the request
-        # size reasonable — large context can cause the model to ignore images.
-        max_history = 10 if msg.media else 50
-        messages = self.context.build_messages(
-            history=session.get_history(max_messages=max_history),
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-        )
-        
-        # Agent loop
-        iteration = 0
-        final_content = None
-        
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            # Call LLM
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
+
+        tracer = trace.get_tracer("nanobot.agent")
+        with tracer.start_as_current_span(
+            "process_message",
+            kind=trace.SpanKind.INTERNAL,
+            attributes={
+                NanobotAttributes.CHANNEL: msg.channel,
+                NanobotAttributes.SENDER_ID: msg.sender_id,
+                NanobotAttributes.SESSION_KEY: msg.session_key,
+                NanobotAttributes.MESSAGE_LENGTH: len(msg.content),
+                NanobotAttributes.MESSAGE_HAS_MEDIA: bool(msg.media),
+            },
+        ) as span:
+            # Get or create session
+            session = self.sessions.get_or_create(msg.session_key)
+
+            # Update tool contexts
+            message_tool = self.tools.get("message")
+            if isinstance(message_tool, MessageTool):
+                message_tool.set_context(msg.channel, msg.chat_id)
+
+            spawn_tool = self.tools.get("spawn")
+            if isinstance(spawn_tool, SpawnTool):
+                spawn_tool.set_context(msg.channel, msg.chat_id)
+
+            cron_tool = self.tools.get("cron")
+            if isinstance(cron_tool, CronTool):
+                cron_tool.set_context(msg.channel, msg.chat_id)
+
+            # Build initial messages (use get_history for LLM-formatted messages)
+            # When media (images) are attached, limit history to keep the request
+            # size reasonable — large context can cause the model to ignore images.
+            max_history = 10 if msg.media else 50
+            messages = self.context.build_messages(
+                history=session.get_history(max_messages=max_history),
+                current_message=msg.content,
+                media=msg.media if msg.media else None,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
             )
-            
-            # Handle tool calls
-            if response.has_tool_calls:
-                # Add assistant message with tool calls
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)  # Must be JSON string
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
+
+            # Agent loop
+            iteration = 0
+            final_content = None
+
+            while iteration < self.max_iterations:
+                iteration += 1
+
+                # Call LLM
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model
                 )
-                
-                # Execute tools
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
 
-                    # Create telemetry span for tool execution
-                    with tool_execution_span(
-                        tool_name=tool_call.name,
-                        tool_call_id=tool_call.id,
-                        arguments=tool_call.arguments,
-                    ) as span:
-                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
-
-                        # Capture the result in telemetry (truncated to 1000 chars)
-                        span.set_result(result, truncate_at=1000)
-
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                # Handle tool calls
+                if response.has_tool_calls:
+                    # Add assistant message with tool calls
+                    tool_call_dicts = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments)  # Must be JSON string
+                            }
+                        }
+                        for tc in response.tool_calls
+                    ]
+                    messages = self.context.add_assistant_message(
+                        messages, response.content, tool_call_dicts,
+                        reasoning_content=response.reasoning_content,
                     )
-            else:
-                # No tool calls, we're done
-                final_content = response.content
-                break
-        
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-        
-        # Log response preview
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
-        
-        # Save to session
-        session.add_message("user", msg.content)
-        session.add_message("assistant", final_content)
-        self.sessions.save(session)
-        
-        return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            content=final_content,
-            metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
-        )
+
+                    # Execute tools
+                    for tool_call in response.tool_calls:
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+
+                        # Create telemetry span for tool execution
+                        with tool_execution_span(
+                            tool_name=tool_call.name,
+                            tool_call_id=tool_call.id,
+                            arguments=tool_call.arguments,
+                        ) as span_tool:
+                            result = await self.tools.execute(tool_call.name, tool_call.arguments)
+
+                            # Capture the result in telemetry (truncated to 1000 chars)
+                            span_tool.set_result(result, truncate_at=1000)
+
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, tool_call.name, result
+                        )
+                else:
+                    # No tool calls, we're done
+                    final_content = response.content
+                    break
+
+            if final_content is None:
+                final_content = "I've completed processing but have no response to give."
+
+            span.set_attribute(NanobotAttributes.ITERATIONS, iteration)
+            span.set_attribute(NanobotAttributes.RESPONSE_LENGTH, len(final_content))
+
+            # Log response preview
+            preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+            logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
+
+            # Save to session
+            session.add_message("user", msg.content)
+            session.add_message("assistant", final_content)
+            self.sessions.save(session)
+
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=final_content,
+                metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+            )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
@@ -272,7 +290,7 @@ class AgentLoop:
         the response back to the correct destination.
         """
         logger.info(f"Processing system message from {msg.sender_id}")
-        
+
         # Parse origin from chat_id (format: "channel:chat_id")
         if ":" in msg.chat_id:
             parts = msg.chat_id.split(":", 1)
@@ -282,95 +300,111 @@ class AgentLoop:
             # Fallback
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
-        
-        # Use the origin session for context
+
         session_key = f"{origin_channel}:{origin_chat_id}"
-        session = self.sessions.get_or_create(session_key)
-        
-        # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(origin_channel, origin_chat_id)
-        
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(origin_channel, origin_chat_id)
-        
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(origin_channel, origin_chat_id)
-        
-        # Build messages with the announce content
-        messages = self.context.build_messages(
-            history=session.get_history(),
-            current_message=msg.content,
-            channel=origin_channel,
-            chat_id=origin_chat_id,
-        )
-        
-        # Agent loop (limited for announce handling)
-        iteration = 0
-        final_content = None
-        
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
+
+        tracer = trace.get_tracer("nanobot.agent")
+        with tracer.start_as_current_span(
+            "process_system_message",
+            kind=trace.SpanKind.INTERNAL,
+            attributes={
+                NanobotAttributes.CHANNEL: origin_channel,
+                NanobotAttributes.SENDER_ID: msg.sender_id,
+                NanobotAttributes.SESSION_KEY: session_key,
+                NanobotAttributes.MESSAGE_LENGTH: len(msg.content),
+                NanobotAttributes.MESSAGE_HAS_MEDIA: False,
+            },
+        ) as span:
+            # Use the origin session for context
+            session = self.sessions.get_or_create(session_key)
+
+            # Update tool contexts
+            message_tool = self.tools.get("message")
+            if isinstance(message_tool, MessageTool):
+                message_tool.set_context(origin_channel, origin_chat_id)
+
+            spawn_tool = self.tools.get("spawn")
+            if isinstance(spawn_tool, SpawnTool):
+                spawn_tool.set_context(origin_channel, origin_chat_id)
+
+            cron_tool = self.tools.get("cron")
+            if isinstance(cron_tool, CronTool):
+                cron_tool.set_context(origin_channel, origin_chat_id)
+
+            # Build messages with the announce content
+            messages = self.context.build_messages(
+                history=session.get_history(),
+                current_message=msg.content,
+                channel=origin_channel,
+                chat_id=origin_chat_id,
             )
-            
-            if response.has_tool_calls:
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
+
+            # Agent loop (limited for announce handling)
+            iteration = 0
+            final_content = None
+
+            while iteration < self.max_iterations:
+                iteration += 1
+
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model
                 )
-                
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
 
-                    # Create telemetry span for tool execution
-                    with tool_execution_span(
-                        tool_name=tool_call.name,
-                        tool_call_id=tool_call.id,
-                        arguments=tool_call.arguments,
-                    ) as span:
-                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                        span.set_result(result, truncate_at=1000)
-
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                if response.has_tool_calls:
+                    tool_call_dicts = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments)
+                            }
+                        }
+                        for tc in response.tool_calls
+                    ]
+                    messages = self.context.add_assistant_message(
+                        messages, response.content, tool_call_dicts,
+                        reasoning_content=response.reasoning_content,
                     )
-            else:
-                final_content = response.content
-                break
-        
-        if final_content is None:
-            final_content = "Background task completed."
-        
-        # Save to session (mark as system message in history)
-        session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
-        session.add_message("assistant", final_content)
-        self.sessions.save(session)
-        
-        return OutboundMessage(
-            channel=origin_channel,
-            chat_id=origin_chat_id,
-            content=final_content
-        )
+
+                    for tool_call in response.tool_calls:
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+
+                        # Create telemetry span for tool execution
+                        with tool_execution_span(
+                            tool_name=tool_call.name,
+                            tool_call_id=tool_call.id,
+                            arguments=tool_call.arguments,
+                        ) as span_tool:
+                            result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                            span_tool.set_result(result, truncate_at=1000)
+
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, tool_call.name, result
+                        )
+                else:
+                    final_content = response.content
+                    break
+
+            if final_content is None:
+                final_content = "Background task completed."
+
+            span.set_attribute(NanobotAttributes.ITERATIONS, iteration)
+            span.set_attribute(NanobotAttributes.RESPONSE_LENGTH, len(final_content))
+
+            # Save to session (mark as system message in history)
+            session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
+            session.add_message("assistant", final_content)
+            self.sessions.save(session)
+
+            return OutboundMessage(
+                channel=origin_channel,
+                chat_id=origin_chat_id,
+                content=final_content
+            )
     
     async def process_direct(
         self,

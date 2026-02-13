@@ -13,10 +13,12 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.web.async_client import AsyncWebClient
 
+from opentelemetry import trace
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import SlackConfig
+from nanobot.telemetry.attributes import MessagingAttributes, NanobotAttributes
 
 
 def markdown_to_slack(text: str) -> str:
@@ -139,119 +141,130 @@ class SlackChannel(BaseChannel):
         if not self._web_client:
             logger.warning("Slack client not running")
             return
-        try:
-            slack_meta = msg.metadata.get("slack", {}) if msg.metadata else {}
-            thread_ts = slack_meta.get("thread_ts")
-            channel_type = slack_meta.get("channel_type")
-            # Only reply in thread for channel/group messages; DMs don't use threads
-            use_thread = thread_ts and channel_type != "im"
 
-            content = msg.content or ""
-            # Convert standard markdown to Slack mrkdwn format
-            slack_content = markdown_to_slack(content)
+        tracer = trace.get_tracer("nanobot.channels.slack")
+        with tracer.start_as_current_span(
+            "slack send",
+            kind=trace.SpanKind.INTERNAL,
+            attributes={
+                MessagingAttributes.SYSTEM: "slack",
+                MessagingAttributes.OPERATION: "send",
+                MessagingAttributes.DESTINATION_NAME: msg.chat_id,
+            },
+        ):
+            try:
+                slack_meta = msg.metadata.get("slack", {}) if msg.metadata else {}
+                thread_ts = slack_meta.get("thread_ts")
+                channel_type = slack_meta.get("channel_type")
+                # Only reply in thread for channel/group messages; DMs don't use threads
+                use_thread = thread_ts and channel_type != "im"
 
-            # Slack has a 3000 character limit per text block
-            # Split long messages into multiple blocks
-            MAX_BLOCK_LENGTH = 3000
-            blocks = []
+                content = msg.content or ""
+                # Convert standard markdown to Slack mrkdwn format
+                slack_content = markdown_to_slack(content)
 
-            if len(slack_content) <= MAX_BLOCK_LENGTH:
-                # Short message - single block
-                blocks.append({
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": slack_content
-                    }
-                })
-            else:
-                # Long message - split into chunks
-                # Try to split at paragraph breaks for better readability
-                chunks = []
-                current_chunk = []
-                current_length = 0
+                # Slack has a 3000 character limit per text block
+                # Split long messages into multiple blocks
+                MAX_BLOCK_LENGTH = 3000
+                blocks = []
 
-                # Split by paragraphs (double newline)
-                paragraphs = slack_content.split('\n\n')
-
-                for para in paragraphs:
-                    para_length = len(para) + 2  # +2 for the \n\n we'll add back
-
-                    # If single paragraph is too long, split it further
-                    if para_length > MAX_BLOCK_LENGTH:
-                        # Save current chunk if any
-                        if current_chunk:
-                            chunks.append('\n\n'.join(current_chunk))
-                            current_chunk = []
-                            current_length = 0
-
-                        # Split long paragraph by sentences or lines
-                        lines = para.split('\n')
-                        line_chunk = []
-                        line_length = 0
-
-                        for line in lines:
-                            if line_length + len(line) + 1 > MAX_BLOCK_LENGTH:
-                                if line_chunk:
-                                    chunks.append('\n'.join(line_chunk))
-                                    line_chunk = []
-                                    line_length = 0
-
-                                # If single line is still too long, hard truncate
-                                if len(line) > MAX_BLOCK_LENGTH:
-                                    chunks.append(line[:MAX_BLOCK_LENGTH - 3] + "...")
-                                else:
-                                    line_chunk.append(line)
-                                    line_length = len(line)
-                            else:
-                                line_chunk.append(line)
-                                line_length += len(line) + 1
-
-                        if line_chunk:
-                            chunks.append('\n'.join(line_chunk))
-                    else:
-                        # Paragraph fits, check if it fits in current chunk
-                        if current_length + para_length > MAX_BLOCK_LENGTH:
-                            # Save current chunk and start new one
-                            chunks.append('\n\n'.join(current_chunk))
-                            current_chunk = [para]
-                            current_length = para_length
-                        else:
-                            current_chunk.append(para)
-                            current_length += para_length
-
-                # Add remaining chunk
-                if current_chunk:
-                    chunks.append('\n\n'.join(current_chunk))
-
-                # Convert chunks to blocks (max 50 blocks per message)
-                for i, chunk in enumerate(chunks[:50]):  # Slack limit: 50 blocks
+                if len(slack_content) <= MAX_BLOCK_LENGTH:
+                    # Short message - single block
                     blocks.append({
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": chunk
+                            "text": slack_content
                         }
                     })
+                else:
+                    # Long message - split into chunks
+                    # Try to split at paragraph breaks for better readability
+                    chunks = []
+                    current_chunk = []
+                    current_length = 0
 
-                # If we had to truncate (more than 50 chunks), add a note
-                if len(chunks) > 50:
-                    blocks.append({
-                        "type": "context",
-                        "elements": [{
-                            "type": "mrkdwn",
-                            "text": f"_Message truncated ({len(chunks) - 50} blocks omitted)_"
-                        }]
-                    })
+                    # Split by paragraphs (double newline)
+                    paragraphs = slack_content.split('\n\n')
 
-            await self._web_client.chat_postMessage(
-                channel=msg.chat_id,
-                text=slack_content,  # Fallback text for notifications
-                blocks=blocks,
-                thread_ts=thread_ts if use_thread else None,
-            )
-        except Exception as e:
-            logger.error(f"Error sending Slack message: {e}")
+                    for para in paragraphs:
+                        para_length = len(para) + 2  # +2 for the \n\n we'll add back
+
+                        # If single paragraph is too long, split it further
+                        if para_length > MAX_BLOCK_LENGTH:
+                            # Save current chunk if any
+                            if current_chunk:
+                                chunks.append('\n\n'.join(current_chunk))
+                                current_chunk = []
+                                current_length = 0
+
+                            # Split long paragraph by sentences or lines
+                            lines = para.split('\n')
+                            line_chunk = []
+                            line_length = 0
+
+                            for line in lines:
+                                if line_length + len(line) + 1 > MAX_BLOCK_LENGTH:
+                                    if line_chunk:
+                                        chunks.append('\n'.join(line_chunk))
+                                        line_chunk = []
+                                        line_length = 0
+
+                                    # If single line is still too long, hard truncate
+                                    if len(line) > MAX_BLOCK_LENGTH:
+                                        chunks.append(line[:MAX_BLOCK_LENGTH - 3] + "...")
+                                    else:
+                                        line_chunk.append(line)
+                                        line_length = len(line)
+                                else:
+                                    line_chunk.append(line)
+                                    line_length += len(line) + 1
+
+                            if line_chunk:
+                                chunks.append('\n'.join(line_chunk))
+                        else:
+                            # Paragraph fits, check if it fits in current chunk
+                            if current_length + para_length > MAX_BLOCK_LENGTH:
+                                # Save current chunk and start new one
+                                chunks.append('\n\n'.join(current_chunk))
+                                current_chunk = [para]
+                                current_length = para_length
+                            else:
+                                current_chunk.append(para)
+                                current_length += para_length
+
+                    # Add remaining chunk
+                    if current_chunk:
+                        chunks.append('\n\n'.join(current_chunk))
+
+                    # Convert chunks to blocks (max 50 blocks per message)
+                    for i, chunk in enumerate(chunks[:50]):  # Slack limit: 50 blocks
+                        blocks.append({
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": chunk
+                            }
+                        })
+
+                    # If we had to truncate (more than 50 chunks), add a note
+                    if len(chunks) > 50:
+                        blocks.append({
+                            "type": "context",
+                            "elements": [{
+                                "type": "mrkdwn",
+                                "text": f"_Message truncated ({len(chunks) - 50} blocks omitted)_"
+                            }]
+                        })
+
+                await self._web_client.chat_postMessage(
+                    channel=msg.chat_id,
+                    text=slack_content,  # Fallback text for notifications
+                    blocks=blocks,
+                    thread_ts=thread_ts if use_thread else None,
+                )
+            except Exception as e:
+                logger.error(f"Error sending Slack message: {e}")
 
     async def _on_socket_request(
         self,
@@ -389,95 +402,105 @@ class SlackChannel(BaseChannel):
         if not files or not self._web_client:
             return []
 
-        local_paths = []
+        tracer = trace.get_tracer("nanobot.channels.slack")
+        with tracer.start_as_current_span(
+            "slack download_files",
+            kind=trace.SpanKind.INTERNAL,
+            attributes={
+                MessagingAttributes.SYSTEM: "slack",
+                MessagingAttributes.OPERATION: "receive",
+            },
+        ) as span:
+            local_paths = []
 
-        _supported = {"image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"}
+            _supported = {"image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"}
 
-        for file_obj in files:
-            mimetype = file_obj.get("mimetype", "")
-            if mimetype not in _supported:
-                logger.debug(f"Skipping unsupported file type: {mimetype}")
-                continue
-
-            url_private = file_obj.get("url_private_download") or file_obj.get("url_private")
-            if not url_private:
-                logger.warning("No download URL for Slack file")
-                continue
-
-            try:
-                # Use Slack SDK to download file with proper authentication
-                # The SDK handles auth and redirects correctly
-                file_id = file_obj.get("id")
-                if not file_id:
-                    logger.warning("No file ID in Slack file object")
+            for file_obj in files:
+                mimetype = file_obj.get("mimetype", "")
+                if mimetype not in _supported:
+                    logger.debug(f"Skipping unsupported file type: {mimetype}")
                     continue
 
-                # Download file using Slack API
-                file_info = await self._web_client.files_info(file=file_id)
-                if not file_info.get("ok"):
-                    logger.error(f"Failed to get file info: {file_info.get('error')}")
+                url_private = file_obj.get("url_private_download") or file_obj.get("url_private")
+                if not url_private:
+                    logger.warning("No download URL for Slack file")
                     continue
 
-                # Get the URL to download
-                file_data = file_info.get("file", {})
-                download_url = file_data.get("url_private_download") or file_data.get("url_private")
+                try:
+                    # Use Slack SDK to download file with proper authentication
+                    # The SDK handles auth and redirects correctly
+                    file_id = file_obj.get("id")
+                    if not file_id:
+                        logger.warning("No file ID in Slack file object")
+                        continue
 
-                if not download_url:
-                    logger.warning("No download URL in file info")
+                    # Download file using Slack API
+                    file_info = await self._web_client.files_info(file=file_id)
+                    if not file_info.get("ok"):
+                        logger.error(f"Failed to get file info: {file_info.get('error')}")
+                        continue
+
+                    # Get the URL to download
+                    file_data = file_info.get("file", {})
+                    download_url = file_data.get("url_private_download") or file_data.get("url_private")
+
+                    if not download_url:
+                        logger.warning("No download URL in file info")
+                        continue
+
+                    # Download using the web client's session which handles auth
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(
+                            download_url,
+                            headers={"Authorization": f"Bearer {self.config.bot_token}"},
+                            follow_redirects=True,
+                            timeout=30.0
+                        )
+                        response.raise_for_status()
+
+                        # Check file size (Anthropic has 5MB limit)
+                        content = response.content
+                        file_size = len(content)
+                        if file_size > 5 * 1024 * 1024:
+                            logger.warning(f"Slack image too large: {file_size} bytes (max 5MB), skipping")
+                            continue
+
+                        # Log first few bytes to verify it's a valid image
+                        header = content[:20].hex() if len(content) >= 20 else content.hex()
+                        logger.debug(f"Image header bytes: {header}")
+
+                        # If it looks like HTML, log the error
+                        if content.startswith(b"<!DOCTYPE") or content.startswith(b"<html"):
+                            error_text = content[:500].decode("utf-8", errors="ignore")
+                            logger.error(f"Received HTML instead of image: {error_text}")
+                            continue
+
+                        # Save to temp file with proper extension
+                        filetype = file_obj.get("filetype", "png")
+                        suffix = f".{filetype}"
+
+                        logger.info(f"Downloading Slack image: mimetype={mimetype}, filetype={filetype}, size={file_size}")
+
+                        with tempfile.NamedTemporaryFile(
+                            mode="wb",
+                            suffix=suffix,
+                            delete=False
+                        ) as tmp:
+                            bytes_written = tmp.write(content)
+                            tmp.flush()  # Explicitly flush to disk
+                            local_path = tmp.name
+                            logger.info(f"Saved Slack image to {local_path} ({bytes_written} bytes written)")
+
+                        # Verify the file was written correctly
+                        if Path(local_path).stat().st_size != file_size:
+                            logger.error(f"File size mismatch: expected {file_size}, got {Path(local_path).stat().st_size}")
+                            continue
+
+                        local_paths.append(local_path)
+
+                except Exception as e:
+                    logger.error(f"Failed to download Slack file: {e}")
                     continue
 
-                # Download using the web client's session which handles auth
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        download_url,
-                        headers={"Authorization": f"Bearer {self.config.bot_token}"},
-                        follow_redirects=True,
-                        timeout=30.0
-                    )
-                    response.raise_for_status()
-
-                    # Check file size (Anthropic has 5MB limit)
-                    content = response.content
-                    file_size = len(content)
-                    if file_size > 5 * 1024 * 1024:
-                        logger.warning(f"Slack image too large: {file_size} bytes (max 5MB), skipping")
-                        continue
-
-                    # Log first few bytes to verify it's a valid image
-                    header = content[:20].hex() if len(content) >= 20 else content.hex()
-                    logger.debug(f"Image header bytes: {header}")
-
-                    # If it looks like HTML, log the error
-                    if content.startswith(b"<!DOCTYPE") or content.startswith(b"<html"):
-                        error_text = content[:500].decode("utf-8", errors="ignore")
-                        logger.error(f"Received HTML instead of image: {error_text}")
-                        continue
-
-                    # Save to temp file with proper extension
-                    filetype = file_obj.get("filetype", "png")
-                    suffix = f".{filetype}"
-
-                    logger.info(f"Downloading Slack image: mimetype={mimetype}, filetype={filetype}, size={file_size}")
-
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        suffix=suffix,
-                        delete=False
-                    ) as tmp:
-                        bytes_written = tmp.write(content)
-                        tmp.flush()  # Explicitly flush to disk
-                        local_path = tmp.name
-                        logger.info(f"Saved Slack image to {local_path} ({bytes_written} bytes written)")
-
-                    # Verify the file was written correctly
-                    if Path(local_path).stat().st_size != file_size:
-                        logger.error(f"File size mismatch: expected {file_size}, got {Path(local_path).stat().st_size}")
-                        continue
-
-                    local_paths.append(local_path)
-
-            except Exception as e:
-                logger.error(f"Failed to download Slack file: {e}")
-                continue
-
-        return local_paths
+            span.set_attribute(NanobotAttributes.FILES_COUNT, len(local_paths))
+            return local_paths
