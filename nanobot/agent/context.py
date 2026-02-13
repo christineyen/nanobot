@@ -142,7 +142,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
 
         return [
             {"role": "system", "content": self.build_system_prompt(skill_names)},
-            *history,
+            *[{**m, "content": m["content"] or "[empty message]"} for m in history],
             {"role": current_role, "content": merged},
         ]
 
@@ -168,7 +168,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         if not media:
             return text
 
-content_blocks = []
+        content_blocks = []
         for path in media:
             p = Path(path)
             if not p.is_file():
@@ -200,7 +200,7 @@ content_blocks = []
             return text
         return content_blocks + [{"type": "text", "text": text}]
 
-        def add_tool_result(
+    def add_tool_result(
         self, messages: list[dict[str, Any]],
         tool_call_id: str, tool_name: str, result: Any,
     ) -> list[dict[str, Any]]:
