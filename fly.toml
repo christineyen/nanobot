@@ -2,6 +2,9 @@
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
+# To sync local config to Fly (replaces workspace path for the volume mount):
+#   fly secrets set NANOBOT_CONFIG_JSON="$(sed 's|~/projects/cos-bot/workspace|/data/workspace|' ~/.nanobot/config.json)"
+#
 
 app = 'nanobot-iypn7w'
 primary_region = 'sjc'
@@ -21,3 +24,4 @@ primary_region = 'sjc'
 [mounts]
   source = "workspace"
   destination = "/data"
+  snapshot_retention = 14
