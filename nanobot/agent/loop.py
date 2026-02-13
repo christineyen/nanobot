@@ -29,7 +29,10 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from nanobot.telemetry import tool_execution_span
+from nanobot.telemetry.attributes import NanobotAttributes
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
@@ -473,61 +476,75 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        await self.memory_consolidator.maybe_consolidate_by_tokens(session)
+        tracer = trace.get_tracer("nanobot.agent")
+        with tracer.start_as_current_span(
+            "process_message",
+            kind=trace.SpanKind.INTERNAL,
+            attributes={
+                NanobotAttributes.CHANNEL: msg.channel,
+                NanobotAttributes.SENDER_ID: msg.sender_id,
+                NanobotAttributes.SESSION_KEY: key,
+                NanobotAttributes.MESSAGE_LENGTH: len(msg.content),
+                NanobotAttributes.MESSAGE_HAS_MEDIA: bool(msg.media),
+            },
+        ) as span:
+            await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
+            self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+            if message_tool := self.tools.get("message"):
+                if isinstance(message_tool, MessageTool):
+                    message_tool.start_turn()
 
-        # When media (images) are attached, limit history to keep the request
-        # size reasonable - large context can cause the model to ignore images.
-        max_history = 0 if not msg.media else 10
-        history = session.get_history(max_messages=max_history)
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
-        )
+            # When media (images) are attached, limit history to keep the request
+            # size reasonable - large context can cause the model to ignore images.
+            max_history = 0 if not msg.media else 10
+            history = session.get_history(max_messages=max_history)
+            initial_messages = self.context.build_messages(
+                history=history,
+                current_message=msg.content,
+                media=msg.media if msg.media else None,
+                channel=msg.channel, chat_id=msg.chat_id,
+            )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+                meta = dict(msg.metadata or {})
+                meta["_progress"] = True
+                meta["_tool_hint"] = tool_hint
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+                ))
+
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                channel=msg.channel, chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
+
+            if final_content is None:
+                final_content = "I've completed processing but have no response to give."
+
+            span.set_attribute(NanobotAttributes.RESPONSE_LENGTH, len(final_content))
+
+            self._save_turn(session, all_msgs, 1 + len(history))
+            self.sessions.save(session)
+            self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+
+            if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+                return None
+
+            preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+            logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
             meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
-
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            channel=msg.channel, chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-        )
-
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-
-        self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
-        self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
-
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            return None
-
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-
-        meta = dict(msg.metadata or {})
-        if on_stream is not None:
-            meta["_streamed"] = True
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=meta,
-        )
+            if on_stream is not None:
+                meta["_streamed"] = True
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=final_content,
+                metadata=meta,
+            )
 
     @staticmethod
     def _image_placeholder(block: dict[str, Any]) -> dict[str, str]:
@@ -607,7 +624,6 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
-
     async def process_direct(
         self,
         content: str,

@@ -14,12 +14,14 @@ from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.web.async_client import AsyncWebClient
 from slackify_markdown import slackify_markdown
 
+from opentelemetry import trace
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from pydantic import Field
 
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Base
+from nanobot.telemetry.attributes import MessagingAttributes, NanobotAttributes
 
 
 class SlackDMConfig(Base):
@@ -115,54 +117,66 @@ class SlackChannel(BaseChannel):
         if not self._web_client:
             logger.warning("Slack client not running")
             return
-        try:
-            slack_meta = msg.metadata.get("slack", {}) if msg.metadata else {}
-            thread_ts = slack_meta.get("thread_ts")
-            channel_type = slack_meta.get("channel_type")
-            # Slack DMs don't use threads; channel/group replies may keep thread_ts.
-            thread_ts_param = thread_ts if thread_ts and channel_type != "im" else None
 
-            # Slack rejects empty text payloads. Keep media-only messages media-only,
-            # but send a single blank message when the bot has no text or files to send.
-            if msg.content or not (msg.media or []):
-                slack_content = self._to_mrkdwn(msg.content) if msg.content else " "
+        from opentelemetry import trace
+        tracer = trace.get_tracer("nanobot.channels.slack")
+        with tracer.start_as_current_span(
+            "slack send",
+            kind=trace.SpanKind.INTERNAL,
+            attributes={
+                MessagingAttributes.SYSTEM: "slack",
+                MessagingAttributes.OPERATION: "send",
+                MessagingAttributes.DESTINATION_NAME: msg.chat_id,
+            },
+        ):
+            try:
+                slack_meta = msg.metadata.get("slack", {}) if msg.metadata else {}
+                thread_ts = slack_meta.get("thread_ts")
+                channel_type = slack_meta.get("channel_type")
+                # Slack DMs don't use threads; channel/group replies may keep thread_ts.
+                thread_ts_param = thread_ts if thread_ts and channel_type != "im" else None
 
-                # Slack has a 3000 character limit per text block.
-                # Split long messages into multiple blocks for readability.
-                MAX_BLOCK_LENGTH = 3000
+                # Slack rejects empty text payloads. Keep media-only messages media-only,
+                # but send a single blank message when the bot has no text or files to send.
+                if msg.content or not (msg.media or []):
+                    slack_content = self._to_mrkdwn(msg.content) if msg.content else " "
 
-                if len(slack_content) <= MAX_BLOCK_LENGTH:
-                    await self._web_client.chat_postMessage(
-                        channel=msg.chat_id,
-                        text=slack_content,
-                        thread_ts=thread_ts_param,
-                    )
-                else:
-                    blocks = self._split_to_blocks(slack_content, MAX_BLOCK_LENGTH)
-                    await self._web_client.chat_postMessage(
-                        channel=msg.chat_id,
-                        text=slack_content[:MAX_BLOCK_LENGTH],  # fallback text
-                        blocks=blocks,
-                        thread_ts=thread_ts_param,
-                    )
+                    # Slack has a 3000 character limit per text block.
+                    # Split long messages into multiple blocks for readability.
+                    MAX_BLOCK_LENGTH = 3000
 
-            for media_path in msg.media or []:
-                try:
-                    await self._web_client.files_upload_v2(
-                        channel=msg.chat_id,
-                        file=media_path,
-                        thread_ts=thread_ts_param,
-                    )
-                except Exception as e:
-                    logger.error("Failed to upload file {}: {}", media_path, e)
+                    if len(slack_content) <= MAX_BLOCK_LENGTH:
+                        await self._web_client.chat_postMessage(
+                            channel=msg.chat_id,
+                            text=slack_content,
+                            thread_ts=thread_ts_param,
+                        )
+                    else:
+                        blocks = self._split_to_blocks(slack_content, MAX_BLOCK_LENGTH)
+                        await self._web_client.chat_postMessage(
+                            channel=msg.chat_id,
+                            text=slack_content[:MAX_BLOCK_LENGTH],  # fallback text
+                            blocks=blocks,
+                            thread_ts=thread_ts_param,
+                        )
 
-            # Update reaction emoji when the final (non-progress) response is sent
-            if not (msg.metadata or {}).get("_progress"):
-                event = slack_meta.get("event", {})
-                await self._update_react_emoji(msg.chat_id, event.get("ts"))
+                for media_path in msg.media or []:
+                    try:
+                        await self._web_client.files_upload_v2(
+                            channel=msg.chat_id,
+                            file=media_path,
+                            thread_ts=thread_ts_param,
+                        )
+                    except Exception as e:
+                        logger.error("Failed to upload file {}: {}", media_path, e)
 
-        except Exception as e:
-            logger.error("Error sending Slack message: {}", e)
+                # Update reaction emoji when the final (non-progress) response is sent
+                if not (msg.metadata or {}).get("_progress"):
+                    event = slack_meta.get("event", {})
+                    await self._update_react_emoji(msg.chat_id, event.get("ts"))
+
+            except Exception as e:
+                logger.error("Error sending Slack message: {}", e)
 
     async def _on_socket_request(
         self,
@@ -437,95 +451,105 @@ class SlackChannel(BaseChannel):
         if not files or not self._web_client:
             return []
 
-        local_paths = []
+        tracer = trace.get_tracer("nanobot.channels.slack")
+        with tracer.start_as_current_span(
+            "slack download_files",
+            kind=trace.SpanKind.INTERNAL,
+            attributes={
+                MessagingAttributes.SYSTEM: "slack",
+                MessagingAttributes.OPERATION: "receive",
+            },
+        ) as span:
+            local_paths = []
 
-        _supported = {"image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"}
+            _supported = {"image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"}
 
-        for file_obj in files:
-            mimetype = file_obj.get("mimetype", "")
-            if mimetype not in _supported:
-                logger.debug(f"Skipping unsupported file type: {mimetype}")
-                continue
-
-            url_private = file_obj.get("url_private_download") or file_obj.get("url_private")
-            if not url_private:
-                logger.warning("No download URL for Slack file")
-                continue
-
-            try:
-                # Use Slack SDK to download file with proper authentication
-                # The SDK handles auth and redirects correctly
-                file_id = file_obj.get("id")
-                if not file_id:
-                    logger.warning("No file ID in Slack file object")
+            for file_obj in files:
+                mimetype = file_obj.get("mimetype", "")
+                if mimetype not in _supported:
+                    logger.debug(f"Skipping unsupported file type: {mimetype}")
                     continue
 
-                # Download file using Slack API
-                file_info = await self._web_client.files_info(file=file_id)
-                if not file_info.get("ok"):
-                    logger.error(f"Failed to get file info: {file_info.get('error')}")
+                url_private = file_obj.get("url_private_download") or file_obj.get("url_private")
+                if not url_private:
+                    logger.warning("No download URL for Slack file")
                     continue
 
-                # Get the URL to download
-                file_data = file_info.get("file", {})
-                download_url = file_data.get("url_private_download") or file_data.get("url_private")
+                try:
+                    # Use Slack SDK to download file with proper authentication
+                    # The SDK handles auth and redirects correctly
+                    file_id = file_obj.get("id")
+                    if not file_id:
+                        logger.warning("No file ID in Slack file object")
+                        continue
 
-                if not download_url:
-                    logger.warning("No download URL in file info")
+                    # Download file using Slack API
+                    file_info = await self._web_client.files_info(file=file_id)
+                    if not file_info.get("ok"):
+                        logger.error(f"Failed to get file info: {file_info.get('error')}")
+                        continue
+
+                    # Get the URL to download
+                    file_data = file_info.get("file", {})
+                    download_url = file_data.get("url_private_download") or file_data.get("url_private")
+
+                    if not download_url:
+                        logger.warning("No download URL in file info")
+                        continue
+
+                    # Download using the web client's session which handles auth
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(
+                            download_url,
+                            headers={"Authorization": f"Bearer {self.config.bot_token}"},
+                            follow_redirects=True,
+                            timeout=30.0
+                        )
+                        response.raise_for_status()
+
+                        # Check file size (Anthropic has 5MB limit)
+                        content = response.content
+                        file_size = len(content)
+                        if file_size > 5 * 1024 * 1024:
+                            logger.warning(f"Slack image too large: {file_size} bytes (max 5MB), skipping")
+                            continue
+
+                        # Log first few bytes to verify it's a valid image
+                        header = content[:20].hex() if len(content) >= 20 else content.hex()
+                        logger.debug(f"Image header bytes: {header}")
+
+                        # If it looks like HTML, log the error
+                        if content.startswith(b"<!DOCTYPE") or content.startswith(b"<html"):
+                            error_text = content[:500].decode("utf-8", errors="ignore")
+                            logger.error(f"Received HTML instead of image: {error_text}")
+                            continue
+
+                        # Save to temp file with proper extension
+                        filetype = file_obj.get("filetype", "png")
+                        suffix = f".{filetype}"
+
+                        logger.info(f"Downloading Slack image: mimetype={mimetype}, filetype={filetype}, size={file_size}")
+
+                        with tempfile.NamedTemporaryFile(
+                            mode="wb",
+                            suffix=suffix,
+                            delete=False
+                        ) as tmp:
+                            bytes_written = tmp.write(content)
+                            tmp.flush()  # Explicitly flush to disk
+                            local_path = tmp.name
+                            logger.info(f"Saved Slack image to {local_path} ({bytes_written} bytes written)")
+
+                        # Verify the file was written correctly
+                        if Path(local_path).stat().st_size != file_size:
+                            logger.error(f"File size mismatch: expected {file_size}, got {Path(local_path).stat().st_size}")
+                            continue
+
+                        local_paths.append(local_path)
+
+                except Exception as e:
+                    logger.error(f"Failed to download Slack file: {e}")
                     continue
 
-                # Download using the web client's session which handles auth
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        download_url,
-                        headers={"Authorization": f"Bearer {self.config.bot_token}"},
-                        follow_redirects=True,
-                        timeout=30.0
-                    )
-                    response.raise_for_status()
-
-                    # Check file size (Anthropic has 5MB limit)
-                    content = response.content
-                    file_size = len(content)
-                    if file_size > 5 * 1024 * 1024:
-                        logger.warning(f"Slack image too large: {file_size} bytes (max 5MB), skipping")
-                        continue
-
-                    # Log first few bytes to verify it's a valid image
-                    header = content[:20].hex() if len(content) >= 20 else content.hex()
-                    logger.debug(f"Image header bytes: {header}")
-
-                    # If it looks like HTML, log the error
-                    if content.startswith(b"<!DOCTYPE") or content.startswith(b"<html"):
-                        error_text = content[:500].decode("utf-8", errors="ignore")
-                        logger.error(f"Received HTML instead of image: {error_text}")
-                        continue
-
-                    # Save to temp file with proper extension
-                    filetype = file_obj.get("filetype", "png")
-                    suffix = f".{filetype}"
-
-                    logger.info(f"Downloading Slack image: mimetype={mimetype}, filetype={filetype}, size={file_size}")
-
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        suffix=suffix,
-                        delete=False
-                    ) as tmp:
-                        bytes_written = tmp.write(content)
-                        tmp.flush()  # Explicitly flush to disk
-                        local_path = tmp.name
-                        logger.info(f"Saved Slack image to {local_path} ({bytes_written} bytes written)")
-
-                    # Verify the file was written correctly
-                    if Path(local_path).stat().st_size != file_size:
-                        logger.error(f"File size mismatch: expected {file_size}, got {Path(local_path).stat().st_size}")
-                        continue
-
-                    local_paths.append(local_path)
-
-            except Exception as e:
-                logger.error(f"Failed to download Slack file: {e}")
-                continue
-
-        return local_paths
+            span.set_attribute(NanobotAttributes.FILES_COUNT, len(local_paths))
+            return local_paths
