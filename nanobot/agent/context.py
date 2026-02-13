@@ -149,11 +149,17 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
         messages.append({"role": "system", "content": system_prompt})
 
-        # History
-        messages.extend(history)
+        # History — sanitize empty content to avoid Anthropic rejecting
+        # empty text blocks (e.g. image-only messages stored as "")
+        for msg in history:
+            if not msg.get("content"):
+                msg = {**msg, "content": "[empty message]"}
+            messages.append(msg)
 
-        # Current message (with optional image attachments)
+        # Current message (with optional media attachments)
         user_content = self._build_user_content(current_message, media)
+        if not user_content:
+            user_content = "[empty message]"
         messages.append({"role": "user", "content": user_content})
 
         return messages
@@ -232,10 +238,10 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             content_blocks.append({"type": "text", "text": text})
 
         # If no media were successfully loaded, just return text
-        if len(content_blocks) == 1 and content_blocks[0]["type"] == "text":
+        if len(content_blocks) <= 1:
             return text
 
-        return content_blocks if content_blocks else text
+        return content_blocks
     
     def add_tool_result(
         self,
