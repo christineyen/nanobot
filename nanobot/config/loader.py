@@ -1,6 +1,7 @@
 """Configuration loading utilities."""
 
 import json
+import os
 from pathlib import Path
 
 import pydantic
@@ -19,9 +20,18 @@ def set_config_path(path: Path) -> None:
 
 
 def get_config_path() -> Path:
-    """Get the configuration file path."""
+    """Get the configuration file path.
+
+    Resolution order:
+      1. Programmatic override via ``set_config_path()``
+      2. ``NANOBOT_CONFIG`` environment variable (path to a JSON file)
+      3. Default ``~/.nanobot/config.json``
+    """
     if _current_config_path:
         return _current_config_path
+    env = os.environ.get("NANOBOT_CONFIG")
+    if env:
+        return Path(env).expanduser().resolve()
     return Path.home() / ".nanobot" / "config.json"
 
 

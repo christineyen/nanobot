@@ -400,8 +400,9 @@ def _make_provider(config: Config):
         needs_key = not (p and p.api_key)
         exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
         if needs_key and not exempt:
+            from nanobot.config.loader import get_config_path
             console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.nanobot/config.json under providers section")
+            console.print(f"Set one in {get_config_path()} under providers section")
             raise typer.Exit(1)
 
     # --- instantiation by backend ---
