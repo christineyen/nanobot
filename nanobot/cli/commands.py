@@ -215,7 +215,7 @@ def onboard():
     
     console.print(f"\n{__logo__} nanobot is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
+    console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print("  2. Chat: [cyan]nanobot agent -m \"Hello!\"[/cyan]")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
@@ -305,8 +305,9 @@ def _make_provider(config):
     p = config.get_provider()
     model = config.agents.defaults.model
     if not (p and p.api_key) and not model.startswith("bedrock/"):
+        from nanobot.config.loader import get_config_path
         console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers section")
+        console.print(f"Set one in {get_config_path()} under providers section")
         raise typer.Exit(1)
     return LiteLLMProvider(
         api_key=p.api_key if p else None,
