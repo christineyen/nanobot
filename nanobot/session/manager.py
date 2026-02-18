@@ -43,6 +43,7 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
+
     @staticmethod
     def _find_legal_start(messages: list[dict[str, Any]]) -> int:
         """Find first index where every tool result has a matching assistant tool_call."""
@@ -91,6 +92,7 @@ class Session:
                     entry[key] = message[key]
             out.append(entry)
         return out
+
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""

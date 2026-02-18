@@ -107,6 +107,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
+
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
         parts = []
@@ -128,6 +129,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
+        cache_control: bool = False,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id)
@@ -140,11 +142,66 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
-        return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+        system_prompt = self.build_system_prompt(skill_names)
+
+        if cache_control:
+            # Emit system as content-block array so we can attach cache_control.
+            system_msg = {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        else:
+            system_msg = {"role": "system", "content": system_prompt}
+
+        messages = [
+            system_msg,
             *[{**m, "content": m["content"] or "[empty message]"} for m in history],
             {"role": current_role, "content": merged},
         ]
+
+        # Mark the last history message for caching so that
+        # subsequent agent-loop iterations get a cache hit on
+        # everything up to this point.
+        if cache_control and len(history) > 0:
+            # The last history message is at index -2 (before the current user message).
+            self._add_cache_breakpoint(messages, -2)
+
+        return messages
+
+    @staticmethod
+    def _add_cache_breakpoint(messages: list[dict[str, Any]], index: int) -> None:
+        """Inject ``cache_control`` into a message at *index*.
+
+        Works for both plain-string content and content-block lists.
+        Tool-role messages get their ``content`` wrapped in a text block
+        so the ``cache_control`` field has somewhere to live.
+        """
+        msg = messages[index]
+        content = msg.get("content")
+
+        if isinstance(content, list):
+            # Already a content-block list — tag the last block.
+            if content:
+                content[-1]["cache_control"] = {"type": "ephemeral"}
+        elif isinstance(content, str):
+            # Wrap the plain string into a content block with cache_control.
+            messages[index] = {
+                **msg,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        # else: leave it alone (e.g. None)
 
     # MIME types that can be sent as image_url content blocks
     _IMAGE_MIMES = frozenset({

@@ -114,6 +114,7 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        self._cache_control = self._supports_cache_control(self.model)
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
@@ -148,6 +149,12 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+
+    @staticmethod
+    def _supports_cache_control(model: str) -> bool:
+        """Return True if the model supports Anthropic-style prompt caching."""
+        return "anthropic" in model.lower() or "claude" in model.lower()
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -207,6 +214,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        cache_control: bool = False,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop.
 
@@ -238,7 +246,7 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
-            tool_defs = self.tools.get_definitions()
+            tool_defs = self.tools.get_definitions(cache_control=cache_control)
 
             if on_stream:
                 response = await self.provider.chat_stream_with_retry(
@@ -308,6 +316,12 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+
+                # After adding tool results, mark the last one for caching
+                # so the next LLM iteration gets a cache hit on everything
+                # up to this point.
+                if cache_control:
+                    self.context._add_cache_breakpoint(messages, -1)
             else:
                 if on_stream and on_stream_end:
                     await on_stream_end(resuming=False)
@@ -449,14 +463,17 @@ class AgentLoop:
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
+            use_cache = self._cache_control
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
+                cache_control=use_cache,
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                cache_control=use_cache,
             )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
@@ -498,12 +515,14 @@ class AgentLoop:
             # When media (images) are attached, limit history to keep the request
             # size reasonable - large context can cause the model to ignore images.
             max_history = 0 if not msg.media else 10
+            use_cache = self._cache_control and not msg.media  # images invalidate cache
             history = session.get_history(max_messages=max_history)
             initial_messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content,
                 media=msg.media if msg.media else None,
                 channel=msg.channel, chat_id=msg.chat_id,
+                cache_control=use_cache,
             )
 
             async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -521,6 +540,7 @@ class AgentLoop:
                 on_stream_end=on_stream_end,
                 channel=msg.channel, chat_id=msg.chat_id,
                 message_id=msg.metadata.get("message_id"),
+                cache_control=use_cache,
             )
 
             if final_content is None:

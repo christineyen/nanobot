@@ -31,13 +31,23 @@ class ToolRegistry:
         """Check if a tool is registered."""
         return name in self._tools
 
-    def get_definitions(self) -> list[dict[str, Any]]:
-        """Get all tool definitions in OpenAI format."""
-        return [tool.to_schema() for tool in self._tools.values()]
+
+    def get_definitions(self, cache_control: bool = False) -> list[dict[str, Any]]:
+        """Get all tool definitions in OpenAI format.
+
+        Args:
+            cache_control: If True, mark the last tool with
+                ``cache_control`` for Anthropic prompt caching.
+        """
+        defs = [tool.to_schema() for tool in self._tools.values()]
+        if cache_control and defs:
+            defs[-1]["cache_control"] = {"type": "ephemeral"}
+        return defs
 
     async def execute(self, name: str, params: dict[str, Any]) -> Any:
         """Execute a tool by name with given parameters."""
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
+
 
         tool = self._tools.get(name)
         if not tool:
