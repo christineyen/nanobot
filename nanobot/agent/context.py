@@ -178,19 +178,34 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
     def _add_cache_breakpoint(messages: list[dict[str, Any]], index: int) -> None:
         """Inject ``cache_control`` into a message at *index*.
 
-        Works for both plain-string content and content-block lists.
-        Tool-role messages get their ``content`` wrapped in a text block
-        so the ``cache_control`` field has somewhere to live.
+        Anthropic allows a maximum of **4** ``cache_control`` breakpoints per
+        request.  Two are "fixed" (the last tool definition and the system
+        prompt) and are managed outside this method.  This method is used for
+        the **conversation tail** — there should only ever be **one** such
+        breakpoint active at a time.
+
+        Before adding the new breakpoint we therefore strip any existing
+        ``cache_control`` from non-system messages so we never exceed the
+        limit.
         """
+        # 1) Remove existing conversation-level breakpoints (skip system).
+        for msg in messages:
+            if msg.get("role") == "system":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        block.pop("cache_control", None)
+
+        # 2) Set the new breakpoint.
         msg = messages[index]
         content = msg.get("content")
 
         if isinstance(content, list):
-            # Already a content-block list — tag the last block.
             if content:
                 content[-1]["cache_control"] = {"type": "ephemeral"}
         elif isinstance(content, str):
-            # Wrap the plain string into a content block with cache_control.
             messages[index] = {
                 **msg,
                 "content": [
@@ -201,7 +216,6 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
                     }
                 ],
             }
-        # else: leave it alone (e.g. None)
 
     # MIME types that can be sent as image_url content blocks
     _IMAGE_MIMES = frozenset({
